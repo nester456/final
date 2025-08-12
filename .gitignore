@@ -1,0 +1,14 @@
+auth/
+.env
+seen.json
+msgstore.json
+forward_metrics.jsonl
+/data/
+*.log
+auth/
+.env
+seen.json
+msgstore.json
+forward_metrics.jsonl
+/data/
+*.log
