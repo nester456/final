@@ -35,6 +35,24 @@ const FORCE_FORWARD_JIDS = (process.env.FORCE_FORWARD_JIDS || '')
 const FORCE_SET = new Set(FORCE_FORWARD_JIDS)
 const shouldForceForward = (jid) => FORCE_SET.has(jid)
 
+// ---------- читабельні назви груп для звітів ----------
+const NAMES_MAP = {
+  "120363044356063512@g.us": "DRC Chernihiv Team",
+  "120363023446341119@g.us": "DRC Dnipro Team",
+  "120363029286365519@g.us": "DRC Kharkiv Team",
+  "120363279744372436@g.us": "DRC Kherson",
+  "120363230226839729@g.us": "Kryvyi Rih Alerts",
+  "120363022703522334@g.us": "Kyiv Country Office",
+  "120363415406262452@g.us": "Lviv Alerts",
+  "120363062976584533@g.us": "DRC Mykolaiv",
+  "120363284910289399@g.us": "Alerts in Odesa",
+  "120363280813470075@g.us": "Shostka Alerts",
+  "120363221232729996@g.us": "Slovyansk Alerts",
+  "120363121851681827@g.us": "DRC Sumy Area Office",
+  "120363166224916518@g.us": "Alerts in Zaporizka"
+}
+const nameOf = (jid) => NAMES_MAP[jid] || jid
+
 // ---------- глобальні перехоплення ----------
 process.on('uncaughtException', (err) => { console.error('❌ uncaughtException:', err) })
 process.on('unhandledRejection', (err) => { console.error('❌ unhandledRejection:', err) })
@@ -297,14 +315,21 @@ function logEvent(ev) {
 // ---------- reporter (щоденний звіт 08:00 Europe/Kyiv) ----------
 const reporterBot = REPORT_BOT_TOKEN ? new TelegramBot(REPORT_BOT_TOKEN, { polling: false }) : null
 
-function formatReportLine(jid, stats) {
+function formatReportLine(jid, s) {
   const g = groupMapping[jid]
   const chan = g ? g.telegramChannelId : '?'
-  return `• ${jid} → ${chan}
-    ├─ detected: ${stats.detected || 0}
-    ├─ sent_ok:  ${stats.sent_ok || 0}
-    ├─ tg_fail:  ${stats.tg_fail || 0}
-    └─ dedup:    ${stats.dedup_skip || 0}`
+  const name = nameOf(jid)
+  const detected = s.detected || 0
+  const sent = s.sent_ok || 0
+  const rate = detected ? Math.round((sent / detected) * 100) : 0
+  return `• ${name} (${jid}) → ${chan}
+    ├─ detected: ${detected} (sent_ok: ${sent}, ${rate}%)
+    ├─ tg_fail:  ${s.tg_fail || 0}
+    ├─ dedup:    ${s.dedup_skip || 0}
+    ├─ skip_no_text:     ${s.skip_no_text || 0}
+    ├─ skip_not_allowed: ${s.skip_not_allowed || 0}
+    ├─ skip_no_mapping:  ${s.skip_no_mapping || 0}
+    └─ skip_old_ts:      ${s.skip_old_ts || 0}`
 }
 
 async function sendDailyReport() {
@@ -320,8 +345,12 @@ async function sendDailyReport() {
   const fromTs = now - dayMs
 
   const perJid = new Map()
-  let total = { detected: 0, sent_ok: 0, tg_fail: 0, dedup_skip: 0 }
-  const recentFails = []
+  let total = {
+    detected: 0, sent_ok: 0, tg_fail: 0, dedup_skip: 0,
+    skip_no_text: 0, skip_not_allowed: 0, skip_no_mapping: 0, skip_old_ts: 0
+  }
+  const recentFails = []   // останні TG помилки (до 10)
+  const recentSkips = []   // останні пропуски (до 10), крім dedup
 
   const downtimeWindows = []
   let lastDown = null
@@ -347,10 +376,26 @@ async function sendDailyReport() {
       total.tg_fail++
       bucket.detected = (bucket.detected || 0) + 1
       total.detected++
-      if (recentFails.length < 10) recentFails.push(`• ${row.ts} ${jid} wa:${row.wa_id} — ${String(row.error || '').slice(0,120)}`)
+      if (recentFails.length < 10) recentFails.push(`• ${row.ts} ${nameOf(jid)} wa:${row.wa_id} — ${String(row.error || '').slice(0,120)}`)
     } else if (row.type === 'dedup_skip') {
       bucket.dedup_skip = (bucket.dedup_skip || 0) + 1
       total.dedup_skip++
+    } else if (row.type === 'skip_no_text') {
+      bucket.skip_no_text = (bucket.skip_no_text || 0) + 1
+      total.skip_no_text++
+      if (recentSkips.length < 10) recentSkips.push(`• ${row.ts} ${nameOf(jid)} wa:${row.wa_id} — no-text`)
+    } else if (row.type === 'skip_not_allowed') {
+      bucket.skip_not_allowed = (bucket.skip_not_allowed || 0) + 1
+      total.skip_not_allowed++
+      if (recentSkips.length < 10) recentSkips.push(`• ${row.ts} ${nameOf(jid)} — filtered: "${String(row.snippet||'').slice(0,80)}"`)
+    } else if (row.type === 'skip_no_mapping') {
+      bucket.skip_no_mapping = (bucket.skip_no_mapping || 0) + 1
+      total.skip_no_mapping++
+      if (recentSkips.length < 10) recentSkips.push(`• ${row.ts} ${nameOf(jid)} wa:${row.wa_id} — no mapping`)
+    } else if (row.type === 'skip_old_ts') {
+      bucket.skip_old_ts = (bucket.skip_old_ts || 0) + 1
+      total.skip_old_ts++
+      if (recentSkips.length < 10) recentSkips.push(`• ${row.ts} ${nameOf(jid)} wa:${row.wa_id} — old ts`)
     }
 
     if (row.type === 'wa_down') {
@@ -368,6 +413,7 @@ async function sendDailyReport() {
     text += formatReportLine(jid, stats) + '\n'
   }
   text += `\n*Разом:*\n• detected: ${total.detected}\n• sent_ok: ${total.sent_ok}\n• tg_fail: ${total.tg_fail}\n• dedup: ${total.dedup_skip}\n`
+  text += `• skip_no_text: ${total.skip_no_text}\n• skip_not_allowed: ${total.skip_not_allowed}\n• skip_no_mapping: ${total.skip_no_mapping}\n• skip_old_ts: ${total.skip_old_ts}\n`
 
   if (downtimeWindows.length) {
     text += `\n🕒 *Вікна простою (ост. 24г):*\n`
@@ -381,6 +427,9 @@ async function sendDailyReport() {
 
   if (recentFails.length) {
     text += `\n*Останні помилки TG (до 10):*\n` + recentFails.join('\n')
+  }
+  if (recentSkips.length) {
+    text += `\n*Останні пропуски (до 10):*\n` + recentSkips.join('\n')
   }
 
   try {
@@ -400,10 +449,10 @@ async function testTelegramMappings() {
   for (const [jid, cfg] of Object.entries(groupMapping)) {
     try {
       const bot = getTgBot(cfg.telegramBotToken)
-      await bot.sendMessage(cfg.telegramChannelId, `🤖 Bot online (test) for ${jid}`)
-      console.log('✅ TG OK →', jid, '→', cfg.telegramChannelId)
+      await bot.sendMessage(cfg.telegramChannelId, `🤖 Bot online (test) for ${nameOf(jid)}`)
+      console.log('✅ TG OK →', nameOf(jid), '→', cfg.telegramChannelId)
     } catch (e) {
-      console.error('❌ TG FAIL →', jid, '→', cfg.telegramChannelId, '-', e?.message || e)
+      console.error('❌ TG FAIL →', nameOf(jid), '→', cfg.telegramChannelId, '-', e?.message || e)
     }
     await new Promise(r => setTimeout(r, 150))
   }
@@ -450,7 +499,8 @@ async function startBot() {
         try {
           const buf = await QRCode.toBuffer(qr, { width: 400 })
           if (reporterBot && REPORT_CHAT_ID) {
-            await reporterBot.sendPhoto(REPORT_CHAT_ID, buf, { caption: '🔐 QR для підключення WhatsApp' })
+            // додаємо filename — прибирає DeprecationWarning
+            await reporterBot.sendPhoto(REPORT_CHAT_ID, { source: buf, filename: 'qr.png' }, { caption: '🔐 QR для підключення WhatsApp' })
             console.log('✅ QR надіслано у звітний канал')
           } else {
             const qrImagePath = path.join(STORAGE_DIR, 'qr.png')
@@ -496,10 +546,16 @@ async function startBot() {
       if (!msgId || !jid || !ts) return
 
       // — ріжемо все, що до старту процесу
-      if (ts < START_TS && !ALLOW_HISTORY) return
+      if (ts < START_TS && !ALLOW_HISTORY) {
+        logEvent({ type: 'skip_old_ts', wa_id: msgId, jid, source: sourceTag })
+        return
+      }
 
       const mapping = groupMapping[jid]
-      if (!mapping) return
+      if (!mapping) {
+        logEvent({ type: 'skip_no_mapping', wa_id: msgId, jid, source: sourceTag })
+        return
+      }
 
       const force = shouldForceForward(jid)
 
@@ -514,20 +570,21 @@ async function startBot() {
       const textRaw = extractText(msg)
 
       if (!textRaw) {
-        console.warn(`⏭️ SKIP: no-text jid=${jid} types=${JSON.stringify(typeKeys)} source=${sourceTag}`)
+        console.warn(`⏭️ SKIP: no-text ${nameOf(jid)} types=${JSON.stringify(typeKeys)} source=${sourceTag}`)
+        logEvent({ type: 'skip_no_text', wa_id: msgId, jid, source: sourceTag })
         if (force) {
           const bot = getTgBot(mapping.telegramBotToken)
-          const placeholder = `[no-text message from ${jid}]`
+          const placeholder = `[no-text message from ${nameOf(jid)}]`
           enqueueSend(bot, mapping.telegramChannelId, placeholder, {
             jid, wa_id: msgId, source: sourceTag, snippet: placeholder
           })
-          console.log(`📤 [FORCE no-text] (${sourceTag}) ${jid}`)
+          console.log(`📤 [FORCE no-text] (${sourceTag}) ${nameOf(jid)}`)
         }
         return
       }
 
       if (!force && !isAllowed(textRaw)) {
-        // не підпало під фільтр
+        logEvent({ type: 'skip_not_allowed', wa_id: msgId, jid, source: sourceTag, snippet: (textRaw||'').slice(0,140) })
         return
       }
 
@@ -539,7 +596,7 @@ async function startBot() {
         source: sourceTag,
         snippet: normalizedText.slice(0, 140)
       })
-      console.log(`${force ? '📤 [FORCE queued]' : '📤 queued'} (${sourceTag}) ${jid}:`, normalizedText.slice(0, 120))
+      console.log(`${force ? '📤 [FORCE queued]' : '📤 queued'} (${sourceTag}) ${nameOf(jid)}:`, normalizedText.slice(0, 120))
     }
 
     // живі нові та (за бажанням) догружені повідомлення
