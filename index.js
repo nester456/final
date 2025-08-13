@@ -1,4 +1,5 @@
-// === WA -> TG forwarder (multi-groups) with daily report & stable Signal sessions ===
+// === WA -> TG forwarder (multi-groups) with history window, late-decrypt handling,
+//     daily report (with group names), catch-up, and strong anti-duplication ===
 
 const {
   makeWASocket,
@@ -23,10 +24,10 @@ console.log('📂 STORAGE_DIR =', STORAGE_DIR)
 const AUTH_DIR = path.join(STORAGE_DIR, 'auth')
 fs.mkdirSync(AUTH_DIR, { recursive: true })
 
-// ---------- ENV / дефолти під твій кейс ----------
-const ALLOW_HISTORY = process.env.ALLOW_HISTORY === '1' // якщо 1 — оброблятимемо історію
-const REPORT_BOT_TOKEN = process.env.REPORT_BOT_TOKEN || '7110570254:AAFvkmZfUTXwcaYsCojEDE4Jmp7RkmO9hK8'
-const REPORT_CHAT_ID  = process.env.REPORT_CHAT_ID  || '-1002882177145'
+// ---------- ENV / дефолти ----------
+const REPORT_BOT_TOKEN = process.env.REPORT_BOT_TOKEN || ''
+const REPORT_CHAT_ID  = process.env.REPORT_CHAT_ID  || ''
+const HISTORY_BACK_MIN = Number(process.env.HISTORY_BACK_MIN || 10) // <— 10 хв за замовчуванням
 const START_TS = Math.floor(Date.now() / 1000) - 30 // не беремо, що старше старту (30с запас)
 
 // --- для діагностики: форс-проксі для конкретних груп (обхід фільтра/дедуп)
@@ -49,7 +50,7 @@ const NAMES_MAP = {
   "120363280813470075@g.us": "Shostka Alerts",
   "120363221232729996@g.us": "Slovyansk Alerts",
   "120363121851681827@g.us": "DRC Sumy Area Office",
-  "120363166224916518@g.us": "Alerts in Zaporizka"
+  "120363166224916518@g.us": "Alerts in Zaporizka",
 }
 const nameOf = (jid) => NAMES_MAP[jid] || jid
 
@@ -61,7 +62,7 @@ process.on('SIGINT',  () => { console.log('🛑 SIGINT');  try { saveMsgStore();
 setInterval(() => console.log('💓 alive', new Date().toISOString()), 5 * 60 * 1000)
 
 // ---------- mapping.json ----------
-const mappingPath = path.join(__dirname, 'mapping.json') // файл поруч з index.js
+const mappingPath = path.join(__dirname, 'mapping.json')
 const groupMapping = JSON.parse(fs.readFileSync(mappingPath, 'utf-8'))
 
 function validateMapping(mapping) {
@@ -164,11 +165,8 @@ function unwrap(msg) {
   while (m?.viewOnceMessageV2Extension?.message) m = m.viewOnceMessageV2Extension.message
   return m || {}
 }
-
 function extractText(msg) {
   const m = unwrap(msg)
-
-  // 1) базові тексти/підписи
   const base =
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -177,47 +175,28 @@ function extractText(msg) {
     m.documentMessage?.caption ||
     m.templateMessage?.hydratedTemplate?.hydratedContentText ||
     m.buttonsMessage?.contentText
-
   if (base) return base
-
-  // 2) інтерактивні відповіді
   const irm = m.interactiveResponseMessage
   if (irm) {
     if (irm?.body?.text) return irm.body.text
-    if (irm?.nativeFlowResponseMessage?.paramsJson) {
-      try {
-        const p = JSON.parse(irm.nativeFlowResponseMessage.paramsJson)
-        return p?.display_text || p?.id || JSON.stringify(p)
-      } catch {}
-    }
-    if (irm?.nativeFlowResponseMessage?.messageParamsJson) {
-      try {
-        const p = JSON.parse(irm.nativeFlowResponseMessage.messageParamsJson)
-        return p?.title || p?.subtitle || p?.description || JSON.stringify(p)
-      } catch {}
-    }
+    const n1 = irm?.nativeFlowResponseMessage?.paramsJson
+    if (n1) { try { const p = JSON.parse(n1); return p?.display_text || p?.id || JSON.stringify(p) } catch {} }
+    const n2 = irm?.nativeFlowResponseMessage?.messageParamsJson
+    if (n2) { try { const p = JSON.parse(n2); return p?.title || p?.subtitle || p?.description || JSON.stringify(p) } catch {} }
   }
-
-  // 3) старі кнопки/листи
   const listResp = m.listResponseMessage
   if (listResp) return listResp?.title || listResp?.singleSelectReply?.selectedRowId || null
-
   const btnResp = m.buttonsResponseMessage
   if (btnResp) return btnResp?.selectedDisplayText || btnResp?.selectedButtonId || null
-
   const tplBtn = m.templateButtonReplyMessage
   if (tplBtn) return tplBtn?.selectedDisplayText || tplBtn?.selectedId || null
-
-  // 4) спробуємо витягнути з процитованого
   const q = m?.extendedTextMessage?.contextInfo?.quotedMessage
   if (q) {
     const qt = extractText({ message: q })
     if (qt) return qt
   }
-
   return null
 }
-
 function normalizeForMatch(s) {
   if (!s) return ''
   return s.normalize('NFC')
@@ -228,16 +207,17 @@ function normalizeForMatch(s) {
     .toLowerCase()
 }
 
-// ---- ФІЛЬТР (заміниш під свій шаблон, коли надішлеш) ----
+// ---- ФІЛЬТР (можна розширити під свій шаблон) ----
 const alertRegexes = [
-  /\b(alert:)?\s*level\s*blue\b|\bтривога:\s*рівень\s*син(ий|iй)\b/i,
-  /\b(alert:)?\s*level\s*yellow\b|\bтривога:\s*рівень\s*жовт(ий|iй)\b/i,
-  /\b(alert:)?\s*level\s*red\b|\bтривога:\s*рівень\s*червон(ий|iй)\b/i,
-  /\b(alert:)?\s*level\s*green\b|\bвідбій:\s*рівень\s*зелен(ий|iй)\b/i,
+  /\b(alert:)?\s*level\s*blue\b|\bтривога:\s*р[іi]вень\s*син(ий|iй)\b/i,
+  /\b(alert:)?\s*level\s*yellow\b|\bтривога:\s*р[іi]вень\s*жовт(ий|iй)\b/i,
+  /\b(alert:)?\s*level\s*red\b|\bтривога:\s*р[іi]вень\s*червон(ий|iй)\b/i,
+  /\b(alert:)?\s*level\s*green\b|\bвідбій:\s*р[іi]вень\s*зелен(ий|iй)\b/i,
   /\bповітряна\s+тривога\b/i,
   /\bвідбій\s+тривоги\b/i,
-  /\bair\s*raid\s*alert\b/i,
-  /\ball\s*clear\b/i,
+  /alert:\s*level\s*blue/i,
+  /🔷\s*alert:\s*level\s*blue/i,
+  /🔷\s*тривога:\s*р[іi]вень\s*син(ий|iй)/i,
 ]
 function isAllowed(text) {
   const raw = text || ''
@@ -291,7 +271,7 @@ function storeMsg(msg) {
 loadMsgStore()
 setInterval(() => { try { saveMsgStore() } catch {} }, 30 * 1000)
 
-// ---------- персистентний лічильник ретраїв (КРИТИЧНО) ----------
+// ---------- персистентний лічильник ретраїв ----------
 const RETRY_PATH = path.join(AUTH_DIR, 'retry.json')
 function loadRetryMap() {
   try { return new Map(JSON.parse(fs.readFileSync(RETRY_PATH, 'utf8'))) } catch { return new Map() }
@@ -313,7 +293,20 @@ function logEvent(ev) {
 }
 
 // ---------- reporter (щоденний звіт 08:00 Europe/Kyiv) ----------
-const reporterBot = REPORT_BOT_TOKEN ? new TelegramBot(REPORT_BOT_TOKEN, { polling: false }) : null
+const reporterBot = (REPORT_BOT_TOKEN && REPORT_CHAT_ID)
+  ? new TelegramBot(REPORT_BOT_TOKEN, { polling: false })
+  : null
+
+const LAST_REPORT_PATH = path.join(STORAGE_DIR, 'last_report.json')
+function getLastReportDateStr() {
+  try { return JSON.parse(fs.readFileSync(LAST_REPORT_PATH,'utf8')).date || null } catch { return null }
+}
+function setLastReportToday() {
+  try {
+    const today = new Date().toLocaleDateString('uk-UA', { timeZone: 'Europe/Kyiv' })
+    fs.writeFileSync(LAST_REPORT_PATH, JSON.stringify({ date: today }))
+  } catch {}
+}
 
 function formatReportLine(jid, s) {
   const g = groupMapping[jid]
@@ -322,7 +315,7 @@ function formatReportLine(jid, s) {
   const detected = s.detected || 0
   const sent = s.sent_ok || 0
   const rate = detected ? Math.round((sent / detected) * 100) : 0
-  return `• ${name} (${jid}) → ${chan}
+  return `• ${name} → ${chan}
     ├─ detected: ${detected} (sent_ok: ${sent}, ${rate}%)
     ├─ tg_fail:  ${s.tg_fail || 0}
     ├─ dedup:    ${s.dedup_skip || 0}
@@ -333,25 +326,20 @@ function formatReportLine(jid, s) {
 }
 
 async function sendDailyReport() {
-  if (!reporterBot || !REPORT_CHAT_ID) {
-    console.log('ℹ️ Reporter disabled (no REPORT_BOT_TOKEN or REPORT_CHAT_ID)')
-    return
-  }
+  if (!reporterBot) { console.log('ℹ️ Reporter disabled'); return }
   let lines
   try { lines = fs.readFileSync(METRICS_PATH, 'utf8').trim().split('\n') } catch { lines = [] }
 
   const now = Date.now()
-  const dayMs = 24 * 60 * 60 * 1000
-  const fromTs = now - dayMs
+  const fromTs = now - 24 * 60 * 60 * 1000
 
   const perJid = new Map()
   let total = {
     detected: 0, sent_ok: 0, tg_fail: 0, dedup_skip: 0,
     skip_no_text: 0, skip_not_allowed: 0, skip_no_mapping: 0, skip_old_ts: 0
   }
-  const recentFails = []   // останні TG помилки (до 10)
-  const recentSkips = []   // останні пропуски (до 10), крім dedup
-
+  const recentFails = []
+  const recentSkips = []
   const downtimeWindows = []
   let lastDown = null
 
@@ -398,20 +386,13 @@ async function sendDailyReport() {
       if (recentSkips.length < 10) recentSkips.push(`• ${row.ts} ${nameOf(jid)} wa:${row.wa_id} — old ts`)
     }
 
-    if (row.type === 'wa_down') {
-      lastDown = ts
-    } else if (row.type === 'wa_up' && lastDown) {
-      downtimeWindows.push({ start: lastDown, end: ts })
-      lastDown = null
-    }
+    if (row.type === 'wa_down') lastDown = ts
+    else if (row.type === 'wa_up' && lastDown) { downtimeWindows.push({ start: lastDown, end: ts }); lastDown = null }
   }
   if (lastDown) downtimeWindows.push({ start: lastDown, end: now })
 
   let text = `📊 *Forwarder — добовий звіт*\nЗа останні 24 години (до ${new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' })}):\n\n`
-
-  for (const [jid, stats] of perJid.entries()) {
-    text += formatReportLine(jid, stats) + '\n'
-  }
+  for (const [jid, stats] of perJid.entries()) text += formatReportLine(jid, stats) + '\n'
   text += `\n*Разом:*\n• detected: ${total.detected}\n• sent_ok: ${total.sent_ok}\n• tg_fail: ${total.tg_fail}\n• dedup: ${total.dedup_skip}\n`
   text += `• skip_no_text: ${total.skip_no_text}\n• skip_not_allowed: ${total.skip_not_allowed}\n• skip_no_mapping: ${total.skip_no_mapping}\n• skip_old_ts: ${total.skip_old_ts}\n`
 
@@ -424,41 +405,32 @@ async function sendDailyReport() {
       text += `• ${startStr} — ${endStr} (${mins} хв)\n`
     }
   }
-
-  if (recentFails.length) {
-    text += `\n*Останні помилки TG (до 10):*\n` + recentFails.join('\n')
-  }
-  if (recentSkips.length) {
-    text += `\n*Останні пропуски (до 10):*\n` + recentSkips.join('\n')
-  }
+  if (recentFails.length) text += `\n*Останні помилки TG (до 10):*\n` + recentFails.join('\n')
+  if (recentSkips.length) text += `\n*Останні пропуски (до 10):*\n` + recentSkips.join('\n')
 
   try {
     await reporterBot.sendMessage(REPORT_CHAT_ID, text, { parse_mode: 'Markdown' })
+    setLastReportToday()
     console.log('✅ Daily report sent')
   } catch (e) {
     console.error('❌ Report send error:', e?.message || e)
   }
 }
 
-// Щодня о 08:00 за Києвом
+// крон на 08:00 Europe/Kyiv
 cron.schedule('0 8 * * *', sendDailyReport, { timezone: 'Europe/Kyiv' })
 
-// ---------- тест TG на старті (опційно) ----------
-async function testTelegramMappings() {
-  console.log('🧪 TG self-check: sending "Bot online" to all mapped channels...')
-  for (const [jid, cfg] of Object.entries(groupMapping)) {
-    try {
-      const bot = getTgBot(cfg.telegramBotToken)
-      await bot.sendMessage(cfg.telegramChannelId, `🤖 Bot online (test) for ${nameOf(jid)}`)
-      console.log('✅ TG OK →', nameOf(jid), '→', cfg.telegramChannelId)
-    } catch (e) {
-      console.error('❌ TG FAIL →', nameOf(jid), '→', cfg.telegramChannelId, '-', e?.message || e)
+// catch-up звіту при старті (якщо процес пропустив 08:00)
+async function reportCatchUpIfMissing() {
+  if (!reporterBot) return
+  try {
+    const today = new Date().toLocaleDateString('uk-UA', { timeZone: 'Europe/Kyiv' })
+    const last = getLastReportDateStr()
+    if (last !== today) {
+      console.log('ℹ️ No report today yet — sending catch-up now...')
+      await sendDailyReport()
     }
-    await new Promise(r => setTimeout(r, 150))
-  }
-}
-if (process.env.TEST_TG_ON_START === 'true') {
-  testTelegramMappings().catch(err => console.error('TG self-check error:', err))
+  } catch (e) { console.warn('⚠️ Catch-up report failed:', e?.message || e) }
 }
 
 // ---------- старт WA сокета ----------
@@ -473,14 +445,11 @@ async function startBot() {
 
     const sock = makeWASocket({
       version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger)
-      },
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       keepAliveIntervalMs: 20_000,
       markOnlineOnConnect: false,
-      // НЕ тягнемо повну історію — її можна ввімкнути ENV ALLOW_HISTORY=1
-      syncFullHistory: ALLOW_HISTORY,
+      // Дозволяємо історичні нотифікації, але ріжемо їх нашим time-window на 10 хв
+      syncFullHistory: true,
       msgRetryCounterMap,
       getMessage: async (key) => {
         const id = key?.id
@@ -498,9 +467,9 @@ async function startBot() {
       if (qr) {
         try {
           const buf = await QRCode.toBuffer(qr, { width: 400 })
-          if (reporterBot && REPORT_CHAT_ID) {
-            // додаємо filename — прибирає DeprecationWarning
-            await reporterBot.sendPhoto(REPORT_CHAT_ID, { source: buf, filename: 'qr.png' }, { caption: '🔐 QR для підключення WhatsApp' })
+          if (REPORT_CHAT_ID && REPORT_BOT_TOKEN) {
+            const bot = reporterBot
+            await bot.sendPhoto(REPORT_CHAT_ID, { source: buf, filename: 'qr.png' }, { caption: '🔐 QR для підключення WhatsApp' })
             console.log('✅ QR надіслано у звітний канал')
           } else {
             const qrImagePath = path.join(STORAGE_DIR, 'qr.png')
@@ -529,14 +498,7 @@ async function startBot() {
     // keep-alive
     setInterval(async () => { try { await sock.sendPresenceUpdate('available') } catch {} }, 5 * 60 * 1000)
 
-    // діагностичні логи ретраїв
-    sock.ev.on('messages.update', (updates) => {
-      for (const u of updates) {
-        if (u.update?.status) console.log('ℹ️ messages.update status:', u.key?.id, u.update.status)
-      }
-    })
-
-    // обробка одного повідомлення
+    // 1) live/append повідомлення (із history window)
     async function handleOneMessage(msg, sourceTag = '') {
       if (msg?.message) storeMsg(msg)
 
@@ -545,8 +507,18 @@ async function startBot() {
       const ts = Number(msg.messageTimestamp) || 0
       if (!msgId || !jid || !ts) return
 
-      // — ріжемо все, що до старту процесу
-      if (ts < START_TS && !ALLOW_HISTORY) {
+      const nowSec = Math.floor(Date.now() / 1000)
+      const isHistory = sourceTag.startsWith('history') || sourceTag.includes('append')
+      if (isHistory) {
+        const backSec = HISTORY_BACK_MIN * 60
+        if (ts < (nowSec - backSec)) {
+          logEvent({ type: 'skip_history_window', wa_id: msgId, jid, source: sourceTag })
+          return
+        }
+      }
+
+      // — відсікаємо все, що до старту процесу
+      if (ts < START_TS) {
         logEvent({ type: 'skip_old_ts', wa_id: msgId, jid, source: sourceTag })
         return
       }
@@ -558,8 +530,6 @@ async function startBot() {
       }
 
       const force = shouldForceForward(jid)
-
-      // дедуп вимикаємо лише для форс-груп
       if (!force) {
         if (wasSeen(msgId)) { logEvent({ type: 'dedup_skip', wa_id: msgId, jid, source: sourceTag }); return }
         markSeen(msgId)
@@ -567,7 +537,14 @@ async function startBot() {
 
       const mUnwrapped = unwrap(msg)
       const typeKeys = Object.keys(mUnwrapped || {})
-      const textRaw = extractText(msg)
+      let textRaw = extractText(msg)
+
+      // якщо нема тексту — коротко чекаємо, можливо, ще дешифрується
+      if (!textRaw) {
+        await new Promise(r => setTimeout(r, 600))
+        const cachedAgain = recentMessages.get(msgId) || msg
+        textRaw = extractText(cachedAgain)
+      }
 
       if (!textRaw) {
         console.warn(`⏭️ SKIP: no-text ${nameOf(jid)} types=${JSON.stringify(typeKeys)} source=${sourceTag}`)
@@ -591,26 +568,41 @@ async function startBot() {
       const normalizedText = textRaw.normalize('NFC')
       const bot = getTgBot(mapping.telegramBotToken)
       enqueueSend(bot, mapping.telegramChannelId, normalizedText, {
-        jid,
-        wa_id: msgId,
-        source: sourceTag,
-        snippet: normalizedText.slice(0, 140)
+        jid, wa_id: msgId, source: sourceTag, snippet: normalizedText.slice(0, 140)
       })
       console.log(`${force ? '📤 [FORCE queued]' : '📤 queued'} (${sourceTag}) ${nameOf(jid)}:`, normalizedText.slice(0, 120))
     }
 
-    // живі нові та (за бажанням) догружені повідомлення
+    // головний live/upsert
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify' && !(ALLOW_HISTORY && type === 'append')) return
+      if (type !== 'notify' && type !== 'append') return
       for (const msg of messages) {
         try { await handleOneMessage(msg, `upsert:${type}`) }
         catch (e) { console.error('❌ handleOneMessage error', e?.stack || e, 'key:', msg?.key) }
       }
     })
 
-    // історія після реконекту — обробляємо ЛИШЕ якщо ALLOW_HISTORY=1
+    // 2) пізнє дешифрування: добираємо текст із messages.update
+    sock.ev.on('messages.update', (updates) => {
+      for (const u of updates) {
+        const id = u?.key?.id
+        if (!id) continue
+        if (u.update?.message) {
+          const prev = recentMessages.get(id) || { key: u.key, messageTimestamp: u.messageTimestamp }
+          const merged = { ...prev, ...u, message: u.update.message }
+          storeMsg(merged)
+          if (!wasSeen(id)) {
+            // не позначаємо тут seen — хай handleOneMessage зробить це централізовано
+            handleOneMessage(merged, 'update:decrypted').catch(e =>
+              console.error('❌ handleOneMessage (update) error', e?.stack || e)
+            )
+          }
+        }
+      }
+    })
+
+    // 3) історичні "set" від WA — обробляємо через наше time-window
     sock.ev.on('messaging-history.set', async ({ messages }) => {
-      if (!ALLOW_HISTORY) return
       const list = Array.isArray(messages) ? messages.slice() : []
       list.sort((a, b) => Number(a?.messageTimestamp || 0) - Number(b?.messageTimestamp || 0))
       console.log(`🕘 history set: ${list.length} msgs`)
@@ -619,6 +611,9 @@ async function startBot() {
         catch (e) { console.error('❌ handleOneMessage error (history)', e?.stack || e, 'key:', msg?.key) }
       }
     })
+
+    // запустимо catch-up звіту
+    reportCatchUpIfMissing().catch(()=>{})
 
   } catch (e) {
     starting = false
