@@ -1,5 +1,5 @@
-// === WA -> TG forwarder with: names in reports, error/skip file logs,
-//     10m history window, late-decrypt, strong anti-dup, daily report (08:00 EET) ===
+// === WA -> TG forwarder with robust decryption handling, 10m history window,
+//     file logs, strong anti-dup, and daily report (08:00 Europe/Kyiv) ===
 
 const {
   makeWASocket,
@@ -15,11 +15,12 @@ const TelegramBot = require('node-telegram-bot-api')
 const cron = require('node-cron')
 const fs = require('fs')
 const path = require('path')
+const NodeCache = require('node-cache')
 
 // ---------- STORAGE ----------
 const STORAGE_DIR = process.env.STORAGE_DIR || __dirname
 fs.mkdirSync(STORAGE_DIR, { recursive: true })
-console.log('📂 STORAGE_DIR = /data')
+console.log('📂 STORAGE_DIR =', STORAGE_DIR)
 
 const AUTH_DIR = path.join(STORAGE_DIR, 'auth')
 fs.mkdirSync(AUTH_DIR, { recursive: true })
@@ -27,19 +28,19 @@ fs.mkdirSync(AUTH_DIR, { recursive: true })
 // ---------- ENV ----------
 const REPORT_BOT_TOKEN = process.env.REPORT_BOT_TOKEN || ''
 const REPORT_CHAT_ID  = process.env.REPORT_CHAT_ID  || ''
-const HISTORY_BACK_MIN = Number(process.env.HISTORY_BACK_MIN || 10) // history window on reconnect
-const SKIP_DUP_MIN = Number(process.env.SKIP_DUPLICATES_MINUTES || 10) // text dedup per JID
-const START_TS = Math.floor(Date.now() / 1000) - 30
+const HISTORY_BACK_MIN = Number(process.env.HISTORY_BACK_MIN || 10) // history window on reconnect (min)
+const SKIP_DUP_MIN = Number(process.env.SKIP_DUPLICATES_MINUTES || 10) // text dedup per JID (min)
+const START_TS = Math.floor(Date.now() / 1000) - 30 // skip anything older than process start (w/ 30s slack)
 
 const ERRORS_FILE  = path.join(STORAGE_DIR, process.env.ERRORS_FILE  || 'errors.log')
 const SKIPPED_FILE = path.join(STORAGE_DIR, process.env.SKIPPED_FILE || 'skipped.log')
 
-// optional: force forward for diagnostics
+// optional: force-forward some JIDs (bypass filters/dedup) for diagnostics
 const FORCE_FORWARD_JIDS = (process.env.FORCE_FORWARD_JIDS || '').split(',').map(s => s.trim()).filter(Boolean)
 const FORCE_SET = new Set(FORCE_FORWARD_JIDS)
 const shouldForceForward = (jid) => FORCE_SET.has(jid)
 
-// ---------- Human-readable group names ----------
+// ---------- Human-friendly group names ----------
 const NAMES_MAP = {
   "120363044356063512@g.us": "DRC Chernihiv Team",
   "120363023446341119@g.us": "DRC Dnipro Team",
@@ -60,8 +61,8 @@ const nameOf = (jid) => NAMES_MAP[jid] || jid
 // ---------- global traps ----------
 process.on('uncaughtException', (err) => { console.error('❌ uncaughtException:', err) })
 process.on('unhandledRejection', (err) => { console.error('❌ unhandledRejection:', err) })
-process.on('SIGTERM', () => { try { saveMsgStore(); saveSeen(true); saveRetryMap(msgRetryCounterMap) } catch {} process.exit(0) })
-process.on('SIGINT',  () => { try { saveMsgStore(); saveSeen(true); saveRetryMap(msgRetryCounterMap) } catch {} process.exit(0) })
+process.on('SIGTERM', () => { try { saveMsgStore(); saveSeen(true) } catch {} process.exit(0) })
+process.on('SIGINT',  () => { try { saveMsgStore(); saveSeen(true) } catch {} process.exit(0) })
 setInterval(() => console.log('💓 alive', new Date().toISOString()), 5 * 60 * 1000)
 
 // ---------- mapping ----------
@@ -131,12 +132,10 @@ function markSeen(id) { seenMap.set(id, Date.now()); if (seenMap.size % 200 === 
 loadSeen()
 setInterval(() => saveSeen(false), 60 * 1000)
 
-// ---------- additional short dedup by text per JID ----------
+// ---------- short dedup by TEXT per JID ----------
 const SHORT_DEDUP_TTL = SKIP_DUP_MIN * 60 * 1000
 const recentTextByJid = new Map() // jid -> [{hash, ts}]
-function hashText(s) {
-  let h = 0; for (let i=0;i<s.length;i++) { h = (h*31 + s.charCodeAt(i)) | 0 } return h>>>0
-}
+function hashText(s) { let h = 0; for (let i=0;i<s.length;i++) { h = (h*31 + s.charCodeAt(i)) | 0 } return h>>>0 }
 function shortDupSeen(jid, text) {
   const now = Date.now()
   const arr = recentTextByJid.get(jid) || []
@@ -179,10 +178,7 @@ async function processQueue(channelId) {
     }
     if (meta) {
       if (ok) logEvent({ type: 'sent_ok', ...meta })
-      else {
-        logEvent({ type: 'tg_fail', ...meta, error: errMsg })
-        appendJsonLine(ERRORS_FILE, { ...meta, error: errMsg })
-      }
+      else { logEvent({ type: 'tg_fail', ...meta, error: errMsg }); appendJsonLine(ERRORS_FILE, { ...meta, error: errMsg }) }
     }
     await new Promise(r => setTimeout(r, 60))
   }
@@ -290,12 +286,6 @@ function storeMsg(msg) {
 loadMsgStore()
 setInterval(() => { try { saveMsgStore() } catch {} }, 30 * 1000)
 
-// ---------- retry map ----------
-const RETRY_PATH = path.join(AUTH_DIR, 'retry.json')
-function loadRetryMap() { try { return new Map(JSON.parse(fs.readFileSync(RETRY_PATH, 'utf8'))) } catch { return new Map() } }
-function saveRetryMap(map) { try { fs.mkdirSync(AUTH_DIR,{recursive:true}); fs.writeFileSync(RETRY_PATH, JSON.stringify([...map])) } catch {} }
-const msgRetryCounterMap = loadRetryMap()
-
 // ---------- metrics (jsonl) ----------
 const METRICS_PATH = path.join(STORAGE_DIR, 'forward_metrics.jsonl')
 function logEvent(ev) {
@@ -345,7 +335,7 @@ function formatLineErrors(jid, s) {
 async function sendDailyReport() {
   if (!reporterBot) { console.log('ℹ️ Reporter disabled'); return }
 
-  // Aggregation from metrics.jsonl
+  // aggregate from metrics.jsonl
   let lines; try { lines = fs.readFileSync(METRICS_PATH,'utf8').trim().split('\n') } catch { lines = [] }
   const now = Date.now(), fromTs = now - 24*60*60*1000
 
@@ -371,7 +361,7 @@ async function sendDailyReport() {
     else if (row.type === 'skip_old_ts' || row.type === 'skip_history_window') { b.skip_old_ts=(b.skip_old_ts||0)+1; totals.skip_old_ts++ }
   }
 
-  // Read file logs for last 24h
+  // tail from file logs (last 24h)
   const recentErrors = readJsonLinesSince(ERRORS_FILE, fromTs).slice(-10)
   const recentSkips  = readJsonLinesSince(SKIPPED_FILE, fromTs).slice(-10)
 
@@ -432,20 +422,22 @@ async function startBot() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
     const { version } = await fetchLatestBaileysVersion()
+    const msgRetryCounterCache = new NodeCache() // <— важливо для ретраїв дешифрування
+
     const sock = makeWASocket({
       version,
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       keepAliveIntervalMs: 20_000,
       markOnlineOnConnect: false,
-      syncFullHistory: true,        // we will cut by our time window
-      msgRetryCounterMap,
+      syncFullHistory: true,        // ми відрізаємо історію своїм вікном часу
+      msgRetryCounterCache,         // <— ключ до стабільного дешифрування
       getMessage: async (key) => {
         const id = key?.id
         return (id && recentMessages.get(id)) || undefined
       }
     })
 
-    sock.ev.on('creds.update', async () => { try { await saveCreds() } catch {}; try { saveRetryMap(msgRetryCounterMap) } catch {} })
+    sock.ev.on('creds.update', async () => { try { await saveCreds() } catch {} })
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       if (qr) {
@@ -454,8 +446,10 @@ async function startBot() {
           if (REPORT_BOT_TOKEN && REPORT_CHAT_ID) {
             const bot = reporterBot
             await bot.sendPhoto(REPORT_CHAT_ID, { source: buf, filename: 'qr.png' }, { caption: '🔐 QR для підключення WhatsApp' })
+            console.log('✅ QR надіслано у звітний канал')
           } else {
             await fs.promises.writeFile(path.join(STORAGE_DIR, 'qr.png'), buf)
+            console.log('✅ QR-код збережено у qr.png — відкрий і скануй 📱')
           }
         } catch (err) { appendJsonLine(ERRORS_FILE, { where:'send_qr', error: err?.message || String(err) }) }
       }
@@ -465,6 +459,7 @@ async function startBot() {
         const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut
         starting = false
+        console.log('⚠️ З’єднання закрито. statusCode:', statusCode, 'reconnect:', shouldReconnect)
         if (shouldReconnect) startBot()
         else process.exit(1)
       }
@@ -477,7 +472,7 @@ async function startBot() {
     // keep-alive
     setInterval(async () => { try { await sock.sendPresenceUpdate('available') } catch {} }, 5 * 60 * 1000)
 
-    // message handling (with history window + anti-dup)
+    // main handler (history window + decrypt waits + anti-dup)
     async function handleOneMessage(msg, sourceTag = '') {
       if (msg?.message) storeMsg(msg)
 
@@ -510,26 +505,25 @@ async function startBot() {
         return
       }
 
-      const force = shouldForceForward(jid)
-      if (!force) {
-        if (wasSeen(msgId)) { logEvent({ type: 'dedup_skip', jid, wa_id: msgId, source: sourceTag }); return }
-        markSeen(msgId)
-      }
-
       const mUnwrapped = unwrap(msg)
       const typeKeys = Object.keys(mUnwrapped || {})
       let textRaw = extractText(msg)
 
+      // wait for late decryption (3 quick retries)
       if (!textRaw) {
-        await new Promise(r => setTimeout(r, 600))
-        const cachedAgain = recentMessages.get(msgId) || msg
-        textRaw = extractText(cachedAgain)
+        for (const delay of [400, 800, 1200]) {
+          await new Promise(r => setTimeout(r, delay))
+          const cachedAgain = recentMessages.get(msgId) || msg
+          textRaw = extractText(cachedAgain)
+          if (textRaw) break
+        }
       }
 
       if (!textRaw) {
+        console.warn(`⏭️ SKIP: no-text ${nameOf(jid)} types=${JSON.stringify(typeKeys)} source=${sourceTag}`)
         logEvent({ type: 'skip_no_text', jid, wa_id: msgId, source: sourceTag })
         appendJsonLine(SKIPPED_FILE, { reason: 'no_text', jid, wa_id: msgId, source: sourceTag, types: typeKeys })
-        if (force) {
+        if (shouldForceForward(jid)) {
           const bot = getTgBot(mapping.telegramBotToken)
           const placeholder = `[no-text message from ${nameOf(jid)}]`
           enqueueSend(bot, mapping.telegramChannelId, placeholder, { jid, wa_id: msgId, source: sourceTag, snippet: placeholder })
@@ -538,17 +532,27 @@ async function startBot() {
       }
 
       // filter
-      if (!force && !isAllowed(textRaw)) {
+      if (!shouldForceForward(jid) && !isAllowed(textRaw)) {
         logEvent({ type: 'skip_not_allowed', jid, wa_id: msgId, source: sourceTag, snippet: (textRaw||'').slice(0,140) })
         appendJsonLine(SKIPPED_FILE, { reason: 'not_allowed', jid, wa_id: msgId, source: sourceTag, snippet: (textRaw||'').slice(0,140) })
         return
       }
 
       const normalizedText = textRaw.normalize('NFC')
-      // short dedup by text per JID (extra safety vs repeats)
-      if (!force && shortDupSeen(jid, normalizedText)) {
+
+      // short dedup by text per JID
+      if (!shouldForceForward(jid) && shortDupSeen(jid, normalizedText)) {
         logEvent({ type: 'dedup_skip', jid, wa_id: msgId, source: sourceTag })
         return
+      }
+
+      // NOW do dedup by WA message id (only when we actually have text & ready to send)
+      if (!shouldForceForward(jid)) {
+        if (wasSeen(msgId)) {
+          logEvent({ type: 'dedup_skip', jid, wa_id: msgId, source: sourceTag })
+          return
+        }
+        markSeen(msgId)
       }
 
       const bot = getTgBot(mapping.telegramBotToken)
@@ -558,7 +562,7 @@ async function startBot() {
       console.log(`📤 queued (${sourceTag}) ${nameOf(jid)}:`, normalizedText.slice(0, 120))
     }
 
-    // live/append
+    // live / append
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return
       for (const msg of messages) {
@@ -567,7 +571,7 @@ async function startBot() {
       }
     })
 
-    // late decrypt: messages.update
+    // late decrypt via messages.update
     sock.ev.on('messages.update', (updates) => {
       for (const u of updates) {
         const id = u?.key?.id; if (!id) continue
@@ -575,11 +579,10 @@ async function startBot() {
           const prev = recentMessages.get(id) || { key: u.key, messageTimestamp: u.messageTimestamp }
           const merged = { ...prev, ...u, message: u.update.message }
           storeMsg(merged)
-          if (!wasSeen(id)) {
-            handleOneMessage(merged, 'update:decrypted').catch(e =>
-              appendJsonLine(ERRORS_FILE, { where:'handle_update', error: e?.message || String(e) })
-            )
-          }
+          // do NOT check wasSeen() here — let handleOneMessage decide after it has text
+          handleOneMessage(merged, 'update:decrypted').catch(e =>
+            appendJsonLine(ERRORS_FILE, { where:'handle_update', error: e?.message || String(e) })
+          )
         }
       }
     })
@@ -605,7 +608,3 @@ async function startBot() {
 }
 
 startBot()
-
-// ---------- retry map helpers ----------
-function loadRetryMap() { try { return new Map(JSON.parse(fs.readFileSync(RETRY_PATH,'utf8'))) } catch { return new Map() } }
-function saveRetryMap(map) { try { fs.mkdirSync(AUTH_DIR,{recursive:true}); fs.writeFileSync(RETRY_PATH, JSON.stringify([...map])) } catch {} }
