@@ -35,6 +35,9 @@ const START_TS = Math.floor(Date.now() / 1000) - 30 // skip anything older than 
 const ERRORS_FILE  = path.join(STORAGE_DIR, process.env.ERRORS_FILE  || 'errors.log')
 const SKIPPED_FILE = path.join(STORAGE_DIR, process.env.SKIPPED_FILE || 'skipped.log')
 
+// NEW: опційний форс-запуск звіту на старті
+const FORCE_REPORT_NOW = String(process.env.FORCE_REPORT_NOW || '').toLowerCase() === 'true'
+
 // optional: force-forward some JIDs (bypass filters/dedup) for diagnostics
 const FORCE_FORWARD_JIDS = (process.env.FORCE_FORWARD_JIDS || '').split(',').map(s => s.trim()).filter(Boolean)
 const FORCE_SET = new Set(FORCE_FORWARD_JIDS)
@@ -387,18 +390,36 @@ async function sendDailyReport() {
     txt += `\n_Останні пропуски (до 10):_\n` + recentSkips.map(s => `• ${s.ts} ${nameOf(s.jid||'?')} — ${s.reason}${s.snippet?` "${String(s.snippet).slice(0,80)}"`:''}`).join('\n')
   }
 
+  // NEW: Markdown → fallback без форматування
   try {
     await reporterBot.sendMessage(REPORT_CHAT_ID, txt, { parse_mode: 'Markdown' })
     setLastReportToday()
-    console.log('✅ Daily report sent')
-  } catch (e) {
-    console.error('❌ Report send error:', e?.message || e)
-    appendJsonLine(ERRORS_FILE, { where:'daily_report', error: e?.message || String(e) })
+    console.log('✅ Daily report sent (Markdown)')
+  } catch (e1) {
+    appendJsonLine(ERRORS_FILE, { where:'daily_report_md_fail', error: e1?.message || String(e1) })
+    console.warn('⚠️ Markdown failed, retrying without parse_mode...')
+    try {
+      await reporterBot.sendMessage(REPORT_CHAT_ID, txt)
+      setLastReportToday()
+      console.log('✅ Daily report sent (plain)')
+    } catch (e2) {
+      console.error('❌ Report send error (plain):', e2?.message || e2)
+      appendJsonLine(ERRORS_FILE, { where:'daily_report_plain_fail', error: e2?.message || String(e2) })
+    }
   }
+}
+
+// NEW: опційний миттєвий запуск звіту на старті (через env)
+if (FORCE_REPORT_NOW) {
+  console.log('ℹ️ FORCE_REPORT_NOW is true — sending report immediately…')
+  sendDailyReport().catch(e =>
+    appendJsonLine(ERRORS_FILE, { where:'force_report_now', error: e?.message || String(e) })
+  )
 }
 
 // Schedule 08:00 Europe/Kyiv
 cron.schedule('0 8 * * *', sendDailyReport, { timezone: 'Europe/Kyiv' })
+console.log('🕗 Daily report scheduled at 08:00 Europe/Kyiv')
 
 // catch-up daily report if missed
 async function reportCatchUpIfMissing() {
@@ -470,7 +491,7 @@ async function startBot() {
     })
 
     // keep-alive
-    setInterval(async () => { try { await sock.sendPresenceUpdate('available') } catch {} }, 5 * 60 * 1000)
+    setInterval(async () => { try { await sock.sendPresenceUpdate('available') } catch {} }, 5 * 1000 * 60)
 
     // main handler (history window + decrypt waits + anti-dup)
     async function handleOneMessage(msg, sourceTag = '') {
