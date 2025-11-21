@@ -1,6 +1,4 @@
-// === WA -> TG forwarder with robust decryption handling, 10m history window,
-//     file logs, strong anti-dup, and daily report (08:00 Europe/Kyiv) ===
-
+// index.js — WA -> TG forwarder with safer Markdown + reconnect/backoff + robust send
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -28,17 +26,14 @@ fs.mkdirSync(AUTH_DIR, { recursive: true })
 // ---------- ENV ----------
 const REPORT_BOT_TOKEN = process.env.REPORT_BOT_TOKEN || ''
 const REPORT_CHAT_ID  = process.env.REPORT_CHAT_ID  || ''
-const HISTORY_BACK_MIN = Number(process.env.HISTORY_BACK_MIN || 10) // history window on reconnect (min)
-const SKIP_DUP_MIN = Number(process.env.SKIP_DUPLICATES_MINUTES || 10) // text dedup per JID (min)
-const START_TS = Math.floor(Date.now() / 1000) - 30 // skip anything older than process start (w/ 30s slack)
+const HISTORY_BACK_MIN = Number(process.env.HISTORY_BACK_MIN || 10)
+const SKIP_DUP_MIN = Number(process.env.SKIP_DUPLICATES_MINUTES || 10)
+const START_TS = Math.floor(Date.now() / 1000) - 30
 
 const ERRORS_FILE  = path.join(STORAGE_DIR, process.env.ERRORS_FILE  || 'errors.log')
 const SKIPPED_FILE = path.join(STORAGE_DIR, process.env.SKIPPED_FILE || 'skipped.log')
 
-// NEW: опційний форс-запуск звіту на старті
 const FORCE_REPORT_NOW = String(process.env.FORCE_REPORT_NOW || '').toLowerCase() === 'true'
-
-// optional: force-forward some JIDs (bypass filters/dedup) for diagnostics
 const FORCE_FORWARD_JIDS = (process.env.FORCE_FORWARD_JIDS || '').split(',').map(s => s.trim()).filter(Boolean)
 const FORCE_SET = new Set(FORCE_FORWARD_JIDS)
 const shouldForceForward = (jid) => FORCE_SET.has(jid)
@@ -137,7 +132,7 @@ setInterval(() => saveSeen(false), 60 * 1000)
 
 // ---------- short dedup by TEXT per JID ----------
 const SHORT_DEDUP_TTL = SKIP_DUP_MIN * 60 * 1000
-const recentTextByJid = new Map() // jid -> [{hash, ts}]
+const recentTextByJid = new Map()
 function hashText(s) { let h = 0; for (let i=0;i<s.length;i++) { h = (h*31 + s.charCodeAt(i)) | 0 } return h>>>0 }
 function shortDupSeen(jid, text) {
   const now = Date.now()
@@ -157,6 +152,26 @@ function getTgBot(token) {
   return tgBots.get(token)
 }
 const channelQueues = new Map()
+
+// safe send wrapper with retries and backoff
+async function safeSend(bot, channelId, text, opts = {}, maxAttempts = 5) {
+  let lastErr = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Node Telegram Bot API expects chatId as string or number
+      const res = await bot.sendMessage(channelId, text, opts)
+      return res
+    } catch (err) {
+      lastErr = err
+      const retryAfter = err?.response?.body?.parameters?.retry_after
+      const wait = retryAfter ? retryAfter * 1000 : Math.min(1000 * Math.pow(2, attempt), 8000)
+      console.warn(`⚠️ Telegram send error (attempt ${attempt}) -> ${String(err?.message || err)}; wait ${wait}ms`)
+      await new Promise(r => setTimeout(r, wait))
+    }
+  }
+  throw lastErr
+}
+
 async function enqueueSend(bot, channelId, text, meta) {
   if (!channelQueues.has(channelId)) channelQueues.set(channelId, { q: [], busy: false })
   const q = channelQueues.get(channelId)
@@ -170,13 +185,15 @@ async function processQueue(channelId) {
   while (q.q.length) {
     const { bot, text, meta } = q.q.shift()
     let ok = false, errMsg = ''
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      try { await bot.sendMessage(channelId, text); ok = true; break }
-      catch (err) {
-        const retryAfter = err?.response?.body?.parameters?.retry_after
-        const wait = retryAfter ? retryAfter * 1000 : Math.min(2000 * attempt, 8000)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await safeSend(bot, channelId, text)
+        ok = true; break
+      } catch (err) {
         errMsg = err?.message || String(err)
-        await new Promise(r => setTimeout(r, wait))
+        console.warn('⚠️ sendMessage failed:', errMsg)
+        // if it's a client error like 400 Bad Request due to parse_mode, we won't retry with parse mode here
+        await new Promise(r => setTimeout(r, 200 * attempt))
       }
     }
     if (meta) {
@@ -311,19 +328,35 @@ function setLastReportToday() {
   } catch {}
 }
 
+// ---------- Markdown escaping helper ----------
+// We'll escape for MarkdownV2 safe subset. If this fails, fall back to plain send.
+function escapeForMarkdownV2(text = '') {
+  if (typeof text !== 'string') text = String(text || '')
+  // Characters to escape in MarkdownV2: _ * [ ] ( ) ~ ` > # + - = | { } . !
+  return text.replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1')
+}
+
+// Short sanitize (truncate & remove newlines) for single-line fields
+function sanitizeShort(text, max = 140) {
+  if (!text && text !== 0) return ''
+  let s = String(text).replace(/\r?\n+/g, ' ')
+  if (s.length > max) s = s.slice(0, max-1) + '…'
+  return s
+}
+
 function formatLineSuccess(jid, s) {
   const g = groupMapping[jid]; const chan = g ? g.telegramChannelId : '?'
   const name = nameOf(jid)
   const detected = s.detected || 0
   const sent = s.sent_ok || 0
   const rate = detected ? Math.round((sent / detected) * 100) : 0
-  return `• ${name} → ${chan}
+  return `• ${escapeForMarkdownV2(name)} → ${escapeForMarkdownV2(chan)}
   ├ detected: ${detected}
   └ sent_ok: ${sent} (${rate}%)`
 }
 function formatLineSkipped(jid, s) {
   const name = nameOf(jid)
-  return `• ${name}
+  return `• ${escapeForMarkdownV2(name)}
   ├ no_text: ${s.skip_no_text || 0}
   ├ not_allowed: ${s.skip_not_allowed || 0}
   ├ no_mapping: ${s.skip_no_mapping || 0}
@@ -332,13 +365,13 @@ function formatLineSkipped(jid, s) {
 }
 function formatLineErrors(jid, s) {
   const name = nameOf(jid)
-  return `• ${name} — tg_fail: ${s.tg_fail || 0}`
+  return `• ${escapeForMarkdownV2(name)} — tg_fail: ${s.tg_fail || 0}`
 }
 
+// Safe reporter send: build Markdown text but escape dynamic bits; fall back to plain send if Markdown fails
 async function sendDailyReport() {
   if (!reporterBot) { console.log('ℹ️ Reporter disabled'); return }
 
-  // aggregate from metrics.jsonl
   let lines; try { lines = fs.readFileSync(METRICS_PATH,'utf8').trim().split('\n') } catch { lines = [] }
   const now = Date.now(), fromTs = now - 24*60*60*1000
 
@@ -364,42 +397,50 @@ async function sendDailyReport() {
     else if (row.type === 'skip_old_ts' || row.type === 'skip_history_window') { b.skip_old_ts=(b.skip_old_ts||0)+1; totals.skip_old_ts++ }
   }
 
-  // tail from file logs (last 24h)
   const recentErrors = readJsonLinesSince(ERRORS_FILE, fromTs).slice(-10)
   const recentSkips  = readJsonLinesSince(SKIPPED_FILE, fromTs).slice(-10)
 
+  // build markdown-safe text
   let txt = `📊 *Forwarder — добовий звіт*\nЗа останні 24 години (до ${new Date().toLocaleString('uk-UA',{timeZone:'Europe/Kyiv'})}):\n`
 
-  // Success section
   txt += `\n*Успішні повідомлення:*\n`
   for (const [jid, s] of perJid.entries()) txt += formatLineSuccess(jid, s) + '\n'
   txt += `\n*Разом:* detected: ${totals.detected} • sent_ok: ${totals.sent_ok}\n`
 
-  // Skipped section
   txt += `\n*Пропущені:*\n`
   for (const [jid, s] of perJid.entries()) txt += formatLineSkipped(jid, s) + '\n'
   txt += `\nΣ: no_text ${totals.skip_no_text} • not_allowed ${totals.skip_not_allowed} • no_mapping ${totals.skip_no_mapping} • old_ts ${totals.skip_old_ts} • dedup ${totals.dedup_skip}\n`
 
-  // Errors section
   txt += `\n*Помилки:*\n`
   for (const [jid, s] of perJid.entries()) txt += formatLineErrors(jid, s) + '\n'
+
   if (recentErrors.length) {
-    txt += `\n_Останні помилки (до 10):_\n` + recentErrors.map(e => `• ${e.ts} ${nameOf(e.jid||'?')} wa:${e.wa_id||'?'} — ${String(e.error||'').slice(0,120)}`).join('\n')
+    txt += `\n_Останні помилки (до 10):_\n` + recentErrors.map(e => {
+      const msg = sanitizeShort(e.error || e.message || '', 120)
+      const jid = escapeForMarkdownV2(nameOf(e.jid || '?'))
+      return `• ${escapeForMarkdownV2(e.ts || '')} ${jid} wa:${escapeForMarkdownV2(e.wa_id || '?')} — ${escapeForMarkdownV2(msg)}`
+    }).join('\n')
   }
   if (recentSkips.length) {
-    txt += `\n_Останні пропуски (до 10):_\n` + recentSkips.map(s => `• ${s.ts} ${nameOf(s.jid||'?')} — ${s.reason}${s.snippet?` "${String(s.snippet).slice(0,80)}"`:''}`).join('\n')
+    txt += `\n_Останні пропуски (до 10):_\n` + recentSkips.map(s => {
+      const reason = sanitizeShort(s.reason || '', 80)
+      const snippet = sanitizeShort(s.snippet || '', 80)
+      return `• ${escapeForMarkdownV2(s.ts || '')} ${escapeForMarkdownV2(nameOf(s.jid||'?'))} — ${escapeForMarkdownV2(reason)}${snippet?` "${escapeForMarkdownV2(snippet)}"`:''}`
+    }).join('\n')
   }
 
-  // NEW: Markdown → fallback без форматування
+  // Try send with MarkdownV2 (escaped). If it fails, fall back to plain.
   try {
-    await reporterBot.sendMessage(REPORT_CHAT_ID, txt, { parse_mode: 'Markdown' })
+    await reporterBot.sendMessage(REPORT_CHAT_ID, txt, { parse_mode: 'MarkdownV2' })
     setLastReportToday()
-    console.log('✅ Daily report sent (Markdown)')
+    console.log('✅ Daily report sent (MarkdownV2)')
   } catch (e1) {
     appendJsonLine(ERRORS_FILE, { where:'daily_report_md_fail', error: e1?.message || String(e1) })
-    console.warn('⚠️ Markdown failed, retrying without parse_mode...')
+    console.warn('⚠️ MarkdownV2 failed, retrying without parse_mode...')
     try {
-      await reporterBot.sendMessage(REPORT_CHAT_ID, txt)
+      // fallback: send plain unescaped summary (keep it short to reduce risk)
+      let plain = `Forwarder — добовий звіт\nЗа останні 24 години (до ${new Date().toLocaleString('uk-UA',{timeZone:'Europe/Kyiv'})}):\n\nРазом: detected: ${totals.detected} • sent_ok: ${totals.sent_ok}\n`
+      await reporterBot.sendMessage(REPORT_CHAT_ID, plain)
       setLastReportToday()
       console.log('✅ Daily report sent (plain)')
     } catch (e2) {
@@ -409,7 +450,6 @@ async function sendDailyReport() {
   }
 }
 
-// NEW: опційний миттєвий запуск звіту на старті (через env)
 if (FORCE_REPORT_NOW) {
   console.log('ℹ️ FORCE_REPORT_NOW is true — sending report immediately…')
   sendDailyReport().catch(e =>
@@ -417,11 +457,9 @@ if (FORCE_REPORT_NOW) {
   )
 }
 
-// Schedule 08:00 Europe/Kyiv
 cron.schedule('0 8 * * *', sendDailyReport, { timezone: 'Europe/Kyiv' })
 console.log('🕗 Daily report scheduled at 08:00 Europe/Kyiv')
 
-// catch-up daily report if missed
 async function reportCatchUpIfMissing() {
   if (!reporterBot) return
   try {
@@ -437,21 +475,24 @@ async function reportCatchUpIfMissing() {
 // ---------- core ----------
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'info' })
 let starting = false
+let startAttempts = 0
 
 async function startBot() {
   if (starting) return; starting = true
+  startAttempts++
+  const backoff = Math.min(30000, 1000 * Math.pow(2, Math.min(startAttempts, 6)))
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
     const { version } = await fetchLatestBaileysVersion()
-    const msgRetryCounterCache = new NodeCache() // <— важливо для ретраїв дешифрування
+    const msgRetryCounterCache = new NodeCache()
 
     const sock = makeWASocket({
       version,
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       keepAliveIntervalMs: 20_000,
       markOnlineOnConnect: false,
-      syncFullHistory: true,        // ми відрізаємо історію своїм вікном часу
-      msgRetryCounterCache,         // <— ключ до стабільного дешифрування
+      syncFullHistory: true,
+      msgRetryCounterCache,
       getMessage: async (key) => {
         const id = key?.id
         return (id && recentMessages.get(id)) || undefined
@@ -464,10 +505,15 @@ async function startBot() {
       if (qr) {
         try {
           const buf = await QRCode.toBuffer(qr, { width: 400 })
-          if (REPORT_BOT_TOKEN && REPORT_CHAT_ID) {
-            const bot = reporterBot
-            await bot.sendPhoto(REPORT_CHAT_ID, { source: buf, filename: 'qr.png' }, { caption: '🔐 QR для підключення WhatsApp' })
-            console.log('✅ QR надіслано у звітний канал')
+          if (REPORT_BOT_TOKEN && REPORT_CHAT_ID && reporterBot) {
+            try {
+              await reporterBot.sendPhoto(REPORT_CHAT_ID, { source: buf, filename: 'qr.png' }, { caption: '🔐 QR для підключення WhatsApp' })
+              console.log('✅ QR надіслано у звітний канал')
+            } catch (e) {
+              // fallback to saving file locally
+              await fs.promises.writeFile(path.join(STORAGE_DIR, 'qr.png'), buf)
+              console.log('✅ QR-код збережено у qr.png — відкрий і скануй 📱 (через помилку надсилання у TG)')
+            }
           } else {
             await fs.promises.writeFile(path.join(STORAGE_DIR, 'qr.png'), buf)
             console.log('✅ QR-код збережено у qr.png — відкрий і скануй 📱')
@@ -481,10 +527,18 @@ async function startBot() {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut
         starting = false
         console.log('⚠️ З’єднання закрито. statusCode:', statusCode, 'reconnect:', shouldReconnect)
-        if (shouldReconnect) startBot()
-        else process.exit(1)
+        if (shouldReconnect) {
+          console.log(`ℹ️ Перепідключення через backoff ${backoff}ms`)
+          setTimeout(() => startBot(), backoff)
+        } else {
+          console.error('❌ Logged out from WhatsApp — need to re-scan QR and re-authenticate.')
+          appendJsonLine(ERRORS_FILE, { where:'wa_logged_out', error: 'logged_out' })
+          // exit so platform (Railway) can restart container if configured
+          process.exit(1)
+        }
       }
       if (connection === 'open') {
+        startAttempts = 0
         logEvent({ type: 'wa_up' })
         console.log('✅ WhatsApp підключено')
       }
@@ -493,7 +547,6 @@ async function startBot() {
     // keep-alive
     setInterval(async () => { try { await sock.sendPresenceUpdate('available') } catch {} }, 5 * 1000 * 60)
 
-    // main handler (history window + decrypt waits + anti-dup)
     async function handleOneMessage(msg, sourceTag = '') {
       if (msg?.message) storeMsg(msg)
 
@@ -552,7 +605,6 @@ async function startBot() {
         return
       }
 
-      // filter
       if (!shouldForceForward(jid) && !isAllowed(textRaw)) {
         logEvent({ type: 'skip_not_allowed', jid, wa_id: msgId, source: sourceTag, snippet: (textRaw||'').slice(0,140) })
         appendJsonLine(SKIPPED_FILE, { reason: 'not_allowed', jid, wa_id: msgId, source: sourceTag, snippet: (textRaw||'').slice(0,140) })
@@ -561,13 +613,11 @@ async function startBot() {
 
       const normalizedText = textRaw.normalize('NFC')
 
-      // short dedup by text per JID
       if (!shouldForceForward(jid) && shortDupSeen(jid, normalizedText)) {
         logEvent({ type: 'dedup_skip', jid, wa_id: msgId, source: sourceTag })
         return
       }
 
-      // NOW do dedup by WA message id (only when we actually have text & ready to send)
       if (!shouldForceForward(jid)) {
         if (wasSeen(msgId)) {
           logEvent({ type: 'dedup_skip', jid, wa_id: msgId, source: sourceTag })
@@ -577,13 +627,14 @@ async function startBot() {
       }
 
       const bot = getTgBot(mapping.telegramBotToken)
-      enqueueSend(bot, mapping.telegramChannelId, normalizedText, {
-        jid, wa_id: msgId, source: sourceTag, snippet: normalizedText.slice(0, 140)
+      // ensure we never forward things that are suspiciously huge into Telegram parse_mode
+      const safeText = sanitizeShort(normalizedText, 4000)
+      enqueueSend(bot, mapping.telegramChannelId, safeText, {
+        jid, wa_id: msgId, source: sourceTag, snippet: safeText.slice(0, 140)
       })
-      console.log(`📤 queued (${sourceTag}) ${nameOf(jid)}:`, normalizedText.slice(0, 120))
+      console.log(`📤 queued (${sourceTag}) ${nameOf(jid)}:`, safeText.slice(0, 120))
     }
 
-    // live / append
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return
       for (const msg of messages) {
@@ -592,7 +643,6 @@ async function startBot() {
       }
     })
 
-    // late decrypt via messages.update
     sock.ev.on('messages.update', (updates) => {
       for (const u of updates) {
         const id = u?.key?.id; if (!id) continue
@@ -600,7 +650,6 @@ async function startBot() {
           const prev = recentMessages.get(id) || { key: u.key, messageTimestamp: u.messageTimestamp }
           const merged = { ...prev, ...u, message: u.update.message }
           storeMsg(merged)
-          // do NOT check wasSeen() here — let handleOneMessage decide after it has text
           handleOneMessage(merged, 'update:decrypted').catch(e =>
             appendJsonLine(ERRORS_FILE, { where:'handle_update', error: e?.message || String(e) })
           )
@@ -608,7 +657,6 @@ async function startBot() {
       }
     })
 
-    // history.set with our time window
     sock.ev.on('messaging-history.set', async ({ messages }) => {
       const list = Array.isArray(messages) ? messages.slice() : []
       list.sort((a,b)=>Number(a?.messageTimestamp||0)-Number(b?.messageTimestamp||0))
@@ -618,13 +666,16 @@ async function startBot() {
       }
     })
 
-    // run catch-up report
     reportCatchUpIfMissing().catch(()=>{})
 
   } catch (e) {
     starting = false
     appendJsonLine(ERRORS_FILE, { where:'startBot', error: e?.message || String(e) })
-    setTimeout(() => startBot(), 3000)
+    console.error('❌ startBot error:', e?.message || e)
+    // exponential backoff restart
+    const delay = Math.min(30000, 1000 * Math.pow(2, Math.min(startAttempts, 6)))
+    console.log(`ℹ️ Retrying startBot in ${delay}ms`)
+    setTimeout(() => startBot(), delay)
   }
 }
 
