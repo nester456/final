@@ -344,6 +344,14 @@ function sanitizeShort(text, max = 140) {
   return s
 }
 
+function sanitizeForTelegram(text, max = 4000) {
+  if (!text && text !== 0) return ''
+  let s = String(text)
+    .replace(/\r\n/g, '\n')     // normalize
+    .replace(/\n{3,}/g, '\n\n') // no more than 2 empty lines
+  if (s.length > max) s = s.slice(0, max - 1) + '…'
+  return s
+}
 function formatLineSuccess(jid, s) {
   const g = groupMapping[jid]; const chan = g ? g.telegramChannelId : '?'
   const name = nameOf(jid)
@@ -556,7 +564,7 @@ async function startBot() {
       if (!msgId || !jid || !ts) return
 
       const nowSec = Math.floor(Date.now() / 1000)
-      const isHistory = sourceTag.startsWith('history') || sourceTag.includes('append')
+const isHistory = sourceTag.startsWith('history')
       if (isHistory) {
         const backSec = HISTORY_BACK_MIN * 60
         if (ts < (nowSec - backSec)) {
