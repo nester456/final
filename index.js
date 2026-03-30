@@ -52,6 +52,7 @@ const NAMES_MAP = {
   "120363280813470075@g.us": "Shostka Alerts",
   "120363221232729996@g.us": "Slovyansk Alerts",
   "120363121851681827@g.us": "DRC Sumy Area Office",
+  "120363425244752526@g.us": "Barvinkove Alerts",
   "120363166224916518@g.us": "Alerts in Zaporizka",
 }
 const nameOf = (jid) => NAMES_MAP[jid] || jid
