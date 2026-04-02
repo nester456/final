@@ -531,21 +531,24 @@ async function startBot() {
       }
 
       if (connection === 'close') {
-        logEvent({ type: 'wa_down' })
-        const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-        starting = false
-        console.log('⚠️ З’єднання закрито. statusCode:', statusCode, 'reconnect:', shouldReconnect)
-        if (shouldReconnect) {
-          console.log(`ℹ️ Перепідключення через backoff ${backoff}ms`)
-          setTimeout(() => startBot(), backoff)
-        } else {
-          console.error('❌ Logged out from WhatsApp — need to re-scan QR and re-authenticate.')
-          appendJsonLine(ERRORS_FILE, { where:'wa_logged_out', error: 'logged_out' })
-          // exit so platform (Railway) can restart container if configured
-          process.exit(1)
-        }
-      }
+  logEvent({ type: 'wa_down' })
+  const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+  const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+  starting = false
+  console.log('⚠️ З’єднання закрито. statusCode:', statusCode, 'reconnect:', shouldReconnect)
+
+  if (shouldReconnect) {
+    console.log(`ℹ️ Перепідключення через backoff ${backoff}ms`)
+    setTimeout(() => startBot(), backoff)
+  } else {
+    console.warn('🔄 Logged out — restarting to get QR...')
+    appendJsonLine(ERRORS_FILE, { where:'wa_logged_out', error: 'logged_out' })
+
+    // 🔥 головна зміна — НЕ вбиваємо процес
+    starting = false
+    setTimeout(() => startBot(), 2000)
+  }
+}
       if (connection === 'open') {
         startAttempts = 0
         logEvent({ type: 'wa_up' })
