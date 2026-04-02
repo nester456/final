@@ -1,4 +1,5 @@
 // index.js — WA -> TG forwarder with safer Markdown + reconnect/backoff + robust send
+const express = require('express')
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -19,6 +20,22 @@ const NodeCache = require('node-cache')
 const STORAGE_DIR = process.env.STORAGE_DIR || __dirname
 fs.mkdirSync(STORAGE_DIR, { recursive: true })
 console.log('📂 STORAGE_DIR =', STORAGE_DIR)
+
+const app = express()
+const PORT = process.env.PORT || 3000
+
+app.get('/qr', (req, res) => {
+  const qrPath = path.join(STORAGE_DIR, 'qr.png')
+  if (fs.existsSync(qrPath)) {
+    res.sendFile(qrPath)
+  } else {
+    res.send('QR ще не згенерований')
+  }
+})
+
+app.listen(PORT, () => {
+  console.log(`🌐 QR server running on port ${PORT}`)
+})
 
 const AUTH_DIR = path.join(STORAGE_DIR, 'auth')
 fs.mkdirSync(AUTH_DIR, { recursive: true })
