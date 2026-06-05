@@ -547,23 +547,40 @@ async function startBot() {
         } catch (err) { appendJsonLine(ERRORS_FILE, { where:'send_qr', error: err?.message || String(err) }) }
       }
 
-      if (connection === 'close') {
+  if (connection === 'close') {
   logEvent({ type: 'wa_down' })
+
   const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
   const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+
   starting = false
-  console.log('⚠️ З’єднання закрито. statusCode:', statusCode, 'reconnect:', shouldReconnect)
+
+  console.log(
+    '⚠️ З’єднання закрито. statusCode:',
+    statusCode,
+    'reconnect:',
+    shouldReconnect
+  )
 
   if (shouldReconnect) {
     console.log(`ℹ️ Перепідключення через backoff ${backoff}ms`)
     setTimeout(() => startBot(), backoff)
   } else {
-    console.warn('🔄 Logged out — restarting to get QR...')
-    appendJsonLine(ERRORS_FILE, { where:'wa_logged_out', error: 'logged_out' })
+    console.warn('🧹 Logged out — clearing auth and requesting new QR...')
 
-    // 🔥 головна зміна — НЕ вбиваємо процес
-    starting = false
-    setTimeout(() => startBot(), 2000)
+    try {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true })
+      fs.mkdirSync(AUTH_DIR, { recursive: true })
+    } catch (e) {
+      console.error('Failed to clear auth:', e)
+    }
+
+    appendJsonLine(ERRORS_FILE, {
+      where: 'wa_logged_out',
+      error: 'logged_out'
+    })
+
+    process.exit(1)
   }
 }
       if (connection === 'open') {
