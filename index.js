@@ -199,27 +199,69 @@ async function enqueueSend(bot, channelId, text, meta) {
 async function processQueue(channelId) {
   const q = channelQueues.get(channelId)
   if (!q || q.busy) return
+
   q.busy = true
+
   while (q.q.length) {
-    const { bot, text, meta } = q.q.shift()
-    let ok = false, errMsg = ''
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        await safeSend(bot, channelId, text)
-        ok = true; break
-      } catch (err) {
-        errMsg = err?.message || String(err)
-        console.warn('⚠️ sendMessage failed:', errMsg)
-        // if it's a client error like 400 Bad Request due to parse_mode, we won't retry with parse mode here
-        await new Promise(r => setTimeout(r, 200 * attempt))
+    const item = q.q.shift()
+    const { bot, text, meta } = item
+
+    item.retries = item.retries || 0
+
+    let ok = false
+    let errMsg = ''
+
+    try {
+      await safeSend(bot, channelId, text)
+      ok = true
+    } catch (err) {
+      errMsg = err?.message || String(err)
+    }
+
+    if (ok) {
+      if (meta) logEvent({ type: 'sent_ok', ...meta })
+    } else {
+
+      const retryable =
+        errMsg.includes('502') ||
+        errMsg.includes('429') ||
+        errMsg.includes('ECONNRESET') ||
+        errMsg.includes('ETIMEDOUT')
+
+      if (retryable && item.retries < 10) {
+
+        item.retries++
+
+        console.warn(
+          `🔁 Telegram unavailable. Retry ${item.retries}/10 in 30 sec`
+        )
+
+        q.q.unshift(item)
+
+        await new Promise(r => setTimeout(r, 30000))
+
+        continue
+      }
+
+      console.warn('❌ Message dropped:', errMsg)
+
+      if (meta) {
+        logEvent({
+          type: 'tg_fail',
+          ...meta,
+          error: errMsg
+        })
+
+        appendJsonLine(ERRORS_FILE, {
+          ...meta,
+          error: errMsg
+        })
       }
     }
-    if (meta) {
-      if (ok) logEvent({ type: 'sent_ok', ...meta })
-      else { logEvent({ type: 'tg_fail', ...meta, error: errMsg }); appendJsonLine(ERRORS_FILE, { ...meta, error: errMsg }) }
-    }
-    await new Promise(r => setTimeout(r, 60))
+
+    await new Promise(r => setTimeout(r, 250))
   }
+
   q.busy = false
 }
 
